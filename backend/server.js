@@ -1,156 +1,277 @@
+// server.js
 require("dotenv").config();
 const express = require("express");
+const mongoose = require("mongoose");
 const http = require("http");
-const socketIO = require("socket.io");
+const { Server } = require("socket.io");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
+const path = require("path");
+
+// your route imports (adjust paths if needed)
+const authRoutes = require("./routes/auth");
+const productRoutes = require("./routes/products");
+const auctionRoutes = require("./routes/auctions");
+
+const Auction = require("./models/Auction");
 
 const app = express();
-const port = process.env.PORT || 5000;
-const server = http.createServer(app);
-const io = socketIO(server, {
-  cors: { origin: "http://localhost:3000", credentials: true },
-});
+const PORT = process.env.PORT || 5000;
 
-// --- Middleware ---
+/* -----------------------------------------
+   MIDDLEWARE
+--------------------------------------------*/
 app.use(
   cors({
     origin: "http://localhost:3000",
+    methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
   })
 );
+
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 
-// --- Models (Array mocks, replace with DB/models in production) ---
-let auctions = []; // [{ id, productId, title, bids: [{user, amount}], endTime, startTime, started, basePrice }]
-let products = require("./models/Product"); // Your products array/object
-
-// --- REST Routes ---
-const authRoutes = require("./routes/auth");
+/* -----------------------------------------
+   ROUTES
+--------------------------------------------*/
 app.use("/api/auth", authRoutes);
-
-const productRoutes = require("./routes/products");
 app.use("/api/products", productRoutes);
-
-// --- Auction REST API (require auctions and products arrays for full context) ---
-const auctionRoutes = require("./routes/auctions");
 app.use("/api/auctions", auctionRoutes);
 
-// --- Root route ---
-app.get("/", (req, res) => {
-  res.send("AgroBid backend server");
+app.get("/", (req, res) => res.send("Backend running"));
+
+/* -----------------------------------------
+   CREATE HTTP + SOCKET.IO SERVER
+--------------------------------------------*/
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:3000",
+    credentials: true,
+  },
 });
 
-// --- Auction Creation REST Route (with real-time emission) ---
-app.post("/api/auctions", (req, res) => {
-  const {
-    productId,
-    title,
-    basePrice,
-    startTime,
-    endTime,
-    farmerId
-    // Add other fields as needed
-  } = req.body;
+// make io accessible to routes if needed
+app.set("io", io);
 
-  const newAuction = {
-    id: `A${Date.now()}_${Math.floor(Math.random() * 100000)}`,
-    productId,
-    title,
-    basePrice,
-    startTime,
-    endTime,
-    started: false,
-    farmerId,
-    currentHighest: basePrice,
-    bids: [],
+/* -----------------------------------------
+   We will maintain a map of running timers per auction.
+   This avoids multiple intervals for the same auction.
+--------------------------------------------*/
+const auctionIntervals = new Map();
+
+/* Helper to start emitting time ticks for an auction */
+async function startAuctionTicker(auctionId) {
+  // don't start twice
+  if (auctionIntervals.has(auctionId)) return;
+
+  // emit once immediately
+  const emitTime = async () => {
+    try {
+      const a = await Auction.findById(auctionId);
+      if (!a) {
+        // stop if auction removed
+        clearIntervalHandle();
+        return;
+      }
+
+      // if auction not active anymore, stop ticker and emit ended
+      if (a.status !== "active") {
+        io.to(auctionId).emit("auctionEnded", { auctionId, auction: a });
+        clearIntervalHandle();
+        return;
+      }
+
+      const payload = {
+        auctionId,
+        serverTime: Date.now(),
+        endTime: new Date(a.endTime).getTime(),
+      };
+
+      io.to(auctionId).emit("time", payload);
+    } catch (e) {
+      console.error("TICK ERROR:", e);
+    }
   };
 
-  auctions.push(newAuction);
+  // Set up interval and fire immediately
+  emitTime();
+  const intId = setInterval(emitTime, 1000);
 
-  // Emit new auction in real time to all buyers
-  io.emit("newAuction", {
-    ...newAuction,
-    product: products.find(p => p.productId === productId) || {},
-  });
+  const clearIntervalHandle = () => {
+    clearInterval(intId);
+    auctionIntervals.delete(auctionId);
+  };
 
-  res.status(201).json({ message: "Auction created", auction: newAuction });
-});
+  auctionIntervals.set(auctionId, { intId, clearIntervalHandle });
+}
 
-// --- Socket.io Real-time Auction ---
+/* If auction becomes active because of scheduled job in routes/auctions,
+   those routes already called `io.emit('auctionStarted', a)` — we need to
+   also start the ticker when auction becomes active. We can listen to that event
+   from this same server's code: when a route emits auctionStarted via io,
+   it will be broadcasted — but starting per-auction ticker is easiest inside
+   server when an active auction is detected or when a client joins. */
+
+/* -----------------------------------------
+   SOCKET EVENTS
+--------------------------------------------*/
 io.on("connection", (socket) => {
-  console.log("Socket connected");
+  console.log("🔥 Socket connected:", socket.id);
 
-  socket.on("joinAuction", ({ auctionId, user }) => {
-    // Only buyers can join
-    if (!user || user.role !== "buyer") return;
+  /* JOIN AUCTION ROOM */
+  socket.on("joinAuction", async (auctionId) => {
+    if (!auctionId) return;
     socket.join(auctionId);
-    const auction = auctions.find((a) => a.id === auctionId);
-    if (auction) {
-      socket.emit("auctionData", auction);
+    console.log(`📥 ${socket.id} joined auction room ${auctionId}`);
+
+    // send immediate time sync + start ticker if active
+    try {
+      const auction = await Auction.findById(auctionId);
+      if (!auction) {
+        // optionally notify client it's invalid
+        socket.emit("bidError", { message: "Auction not found" });
+        return;
+      }
+
+      // time sync payload
+      socket.emit("time", {
+        auctionId,
+        serverTime: Date.now(),
+        endTime: new Date(auction.endTime).getTime(),
+      });
+
+      // if auction active, start ticker for this auction (if not started)
+      if (auction.status === "active") {
+        startAuctionTicker(auctionId);
+      }
+    } catch (err) {
+      console.error("JOIN AUCTION ERROR:", err);
     }
   });
 
-  socket.on("placeBid", ({ auctionId, user, bidAmount }) => {
-    // Only buyers can bid
-    if (!user || user.role !== "buyer") return;
-    const auction = auctions.find((a) => a.id === auctionId);
-    if (auction && auction.started && Date.now() < auction.endTime) {
-      if (bidAmount > (auction.currentHighest || auction.basePrice)) {
-        auction.bids.push({ user: user.name, amount: bidAmount });
-        auction.currentHighest = bidAmount;
-        io.to(auctionId).emit("bidUpdate", {
-          user: user.name,
-          bidAmount,
-          auctionId,
+  /* LEAVE AUCTION ROOM */
+  socket.on("leaveAuction", (auctionId) => {
+    socket.leave(auctionId);
+    console.log(`📤 ${socket.id} left auction room ${auctionId}`);
+  });
+
+  /* -----------------------------------------
+     PLACE BID — robust handling
+  --------------------------------------------*/
+  socket.on("placeBid", async (payload) => {
+    try {
+      // normalize input
+      const {
+        auctionId,
+        bidderId,
+        bidderName,
+        amount, // we expect `amount` (number)
+      } = payload || {};
+
+      console.log("📥 Received bid:", payload);
+
+      if (!auctionId || !amount) {
+        return socket.emit("bidRejected", { message: "Invalid bid data" });
+      }
+
+      const auction = await Auction.findById(auctionId);
+      if (!auction) {
+        return socket.emit("bidRejected", { message: "Auction not found" });
+      }
+
+      if (auction.status !== "active") {
+        return socket.emit("bidRejected", { message: "Auction is not active" });
+      }
+
+      if (amount <= auction.currentHighest) {
+        return socket.emit("bidRejected", {
+          message: "Bid must be higher",
+          currentHighest: auction.currentHighest,
         });
       }
+
+      // persist bid
+      auction.currentHighest = amount;
+      auction.bids.push({
+        bidderId,
+        bidderName,
+        amount,
+        timestamp: new Date(),
+      });
+
+      await auction.save();
+
+      // prepare payload to broadcast
+      const bidPayload = {
+        auctionId,
+        amount,
+        bidderName,
+        bidderId,
+        timestamp: new Date().toISOString(),
+      };
+
+      console.log("📡 Broadcasting bidUpdate:", bidPayload);
+      io.to(auctionId).emit("bidUpdate", bidPayload);
+
+      // ensure ticker is running (so time sync continues)
+      startAuctionTicker(auctionId);
+
+    } catch (err) {
+      console.error("❌ Bid Error:", err);
+      socket.emit("bidError", { message: "Server error placing bid" });
     }
   });
 
-  socket.on("startAuction", ({ auctionId }) => {
-    const auction = auctions.find((a) => a.id === auctionId);
-    if (auction) {
-      auction.started = true;
-      io.emit("auctionStatusChanged", {
-        auctionId: auction.id,
-        started: auction.started,
-        startTime: auction.startTime,
-        endTime: auction.endTime,
-      });
-      io.to(auctionId).emit("auctionStarted");
-    }
-  });
-
-  socket.on("endAuction", ({ auctionId }) => {
-    const auction = auctions.find((a) => a.id === auctionId);
-    if (auction) {
-      auction.started = false;
-      io.emit("auctionStatusChanged", {
-        auctionId: auction.id,
-        started: auction.started,
-        startTime: auction.startTime,
-        endTime: auction.endTime,
-      });
-      // Winner logic: highest bid
-      const highestBid = auction.bids.reduce(
-        (max, b) => (b.amount > max.amount ? b : max),
-        { amount: auction.basePrice, user: null }
-      );
-      io.to(auctionId).emit("auctionEnded", {
-        winner: highestBid.user,
-        amount: highestBid.amount,
-      });
-    }
-  });
-
+  /* DISCONNECT */
   socket.on("disconnect", () => {
-    console.log("Socket disconnected");
+    console.log("⚠️ Socket disconnected:", socket.id);
   });
 });
 
-// --- Start Combined REST + Socket.io Server ---
-server.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
-});
+/* -----------------------------------------
+   Periodic check for auctions that should be ended (safety)
+   This runs every 5 seconds and will mark auctions ended if their endTime passed.
+   When ended, it emits auctionEnded and stops the ticker.
+--------------------------------------------*/
+setInterval(async () => {
+  try {
+    const now = new Date();
+    const toEnd = await Auction.find({
+      status: "active",
+      endTime: { $lte: now },
+    });
+
+    for (const a of toEnd) {
+      a.status = "ended";
+      await a.save();
+
+      // notify room
+      io.to(a._id.toString()).emit("auctionEnded", { auctionId: a._id.toString(), auction: a });
+
+      // stop ticker if running
+      const t = auctionIntervals.get(a._id.toString());
+      if (t?.clearIntervalHandle) t.clearIntervalHandle();
+    }
+  } catch (e) {
+    console.error("AUTO-END CHECK ERROR:", e);
+  }
+}, 5000);
+
+/* -----------------------------------------
+   START SERVER
+--------------------------------------------*/
+mongoose
+  .connect(process.env.MONGO_URL)
+  .then(() => {
+    console.log("📦 MongoDB connected");
+    server.listen(PORT, () => {
+      console.log(`🚀 Server running: http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("❌ DB Error:", err.message);
+    process.exit(1);
+  });

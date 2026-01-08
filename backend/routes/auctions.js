@@ -1,54 +1,183 @@
-const express = require('express');
+// routes/auctions.js
+const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 
-let auctions = require('../models/Auction');   // Your auctions array/object
-let products = require('../models/Product');   // Your products array/object
+const Auction = require("../models/Auction");
+const Product = require("../models/Product");
 
-// Get all auctions by farmer
-router.get('/my-auctions', (req, res) => {
-  const userId = req.user.id; // Ensure auth middleware sets req.user
-  const myAuctions = auctions.filter(a => a.farmerId === userId);
-  res.json({ auctions: myAuctions });
+/* ==========================================================
+   GET ALL AUCTIONS
+========================================================== */
+router.get("/", async (req, res) => {
+  try {
+    const auctions = await Auction.find()
+      .populate("productId")
+      .sort({ createdAt: -1 });
+
+    return res.json(auctions);
+  } catch (err) {
+    console.error("AUCTION FETCH ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 });
 
-// Update auction (edit time, details)
-router.put('/:auctionId', (req, res) => {
-  const userId = req.user.id;
-  const { auctionId } = req.params;
-  const updates = req.body;
-  const idx = auctions.findIndex(a => a.auctionId === auctionId && a.farmerId === userId);
+/* ==========================================================
+   GET LIVE AUCTIONS
+========================================================== */
+router.get("/live", async (req, res) => {
+  try {
+    const now = new Date();
 
-  if (idx === -1) return res.status(404).json({ message: "Auction not found or unauthorized" });
-  if (auctions[idx].status === 'active') return res.status(400).json({ message: "Cannot edit active auction" });
+    const liveAuctions = await Auction.find({
+      status: "active",
+      endTime: { $gt: now },
+    }).populate("productId");
 
-  auctions[idx] = { ...auctions[idx], ...updates };
-  res.json({ message: "Auction updated", auction: auctions[idx] });
+    return res.json(liveAuctions);
+  } catch (err) {
+    console.error("LIVE AUCTIONS ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 });
 
-// Cancel auction
-router.delete('/:auctionId', (req, res) => {
-  const userId = req.user.id;
-  const { auctionId } = req.params;
-  const idx = auctions.findIndex(a => a.auctionId === auctionId && a.farmerId === userId);
+/* ==========================================================
+   GET AUCTION BY ID (USED BY AUCTION ROOM)
+========================================================== */
+router.get("/:id", async (req, res) => {
+  const { id } = req.params;
 
-  if (idx === -1) return res.status(404).json({ message: "Auction not found or unauthorized" });
-  if (auctions[idx].status === 'active') return res.status(400).json({ message: "Cannot cancel active auction" });
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({ message: "Invalid auction id" });
+  }
 
-  auctions[idx].status = 'canceled';
-  res.json({ message: "Auction canceled successfully" });
+  try {
+    const auction = await Auction.findById(id).populate("productId");
+
+    if (!auction) return res.status(404).json({ message: "Auction not found" });
+
+    return res.json(auction);
+  } catch (err) {
+    console.error("GET SINGLE AUCTION ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 });
 
-// Get live auctions (for buyers, including product details)
-router.get('/live', (req, res) => {
-  const now = Date.now();
-  // Only include auctions that are started and not expired
-  const liveAuctions = auctions
-    .filter(a => a.started && a.endTime > now)
-    .map(a => ({
-      ...a,
-      product: products.find(p => p.productId === a.productId) || {}
-    }));
-  res.json({ auctions: liveAuctions });
+/* ==========================================================
+   CREATE NEW AUCTION
+========================================================== */
+router.post("/", async (req, res) => {
+  try {
+   io.to(auctionId).emit("bidUpdate", bidPayload); // important for real-time events
+
+
+    const { productId, title, basePrice, startTime, endTime, farmerId } =
+      req.body;
+
+    if (!productId || !title || !basePrice || !startTime || !endTime || !farmerId) {
+      return res.status(400).json({ message: "Missing fields" });
+    }
+
+    const auction = await Auction.create({
+      productId,
+      title,
+      basePrice,
+      currentHighest: basePrice,
+      startTime,
+      endTime,
+      farmerId,
+      bids: [],
+      started: false,
+      status: "scheduled",
+    });
+
+    // Notify all buyers/farmers that auction was created
+    io?.emit("newAuction", auction);
+
+    /* -------- AUTO START AUCTION ---------- */
+    const startDelay = Math.max(new Date(startTime) - Date.now(), 0);
+    setTimeout(async () => {
+      const a = await Auction.findById(auction._id);
+      if (!a || a.status !== "scheduled") return;
+
+      a.status = "active";
+      a.started = true;
+      await a.save();
+
+      io?.emit("auctionStarted", a);
+    }, startDelay);
+
+    /* -------- AUTO END AUCTION ---------- */
+    const endDelay = Math.max(new Date(endTime) - Date.now(), 0);
+    setTimeout(async () => {
+      const a = await Auction.findById(auction._id);
+      if (!a || a.status !== "active") return;
+
+      a.status = "ended";
+      await a.save();
+
+      io?.emit("auctionEnded", a);
+    }, endDelay);
+
+    return res.status(201).json({ message: "Auction created", auction });
+  } catch (err) {
+    console.error("CREATE AUCTION ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ==========================================================
+   UPDATE AUCTION (ONLY BEFORE START)
+========================================================== */
+router.put("/:auctionId", async (req, res) => {
+  try {
+    const { auctionId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(auctionId)) {
+      return res.status(400).json({ message: "Invalid auction id" });
+    }
+
+    const auction = await Auction.findById(auctionId);
+    if (!auction) return res.status(404).json({ message: "Auction not found" });
+
+    if (auction.started)
+      return res.status(400).json({ message: "Cannot update active auction" });
+
+    Object.assign(auction, req.body);
+    await auction.save();
+
+    return res.json({ message: "Auction updated", auction });
+  } catch (err) {
+    console.error("UPDATE AUCTION ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ==========================================================
+   CANCEL AUCTION (FARMER ONLY)
+========================================================== */
+router.delete("/:auctionId", async (req, res) => {
+  try {
+    const { auctionId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(auctionId)) {
+      return res.status(400).json({ message: "Invalid auction id" });
+    }
+
+    const auction = await Auction.findById(auctionId);
+    if (!auction) return res.status(404).json({ message: "Auction not found" });
+
+    if (auction.started)
+      return res.status(400).json({ message: "Cannot cancel active auction" });
+
+    auction.status = "canceled";
+    await auction.save();
+
+    return res.json({ message: "Auction canceled" });
+  } catch (err) {
+    console.error("DELETE AUCTION ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 });
 
 module.exports = router;
